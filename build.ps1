@@ -19,10 +19,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 cargo build --release --target x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 $dist = Join-Path $PSScriptRoot 'dist'
+if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force "$dist/core" | Out-Null
 Copy-Item "$($exe.Directory.FullName)\*" "$dist/core" -Recurse -Force
 Copy-Item 'target/x86_64-pc-windows-msvc/release/litelan.exe' "$dist/LiteLAN.exe" -Force
 Copy-Item README.md,THIRD_PARTY.md "$dist/" -Force
-Copy-Item run-admin.bat "$dist/" -Force
 Compress-Archive -Path "$dist/*" -DestinationPath "$PSScriptRoot/LiteLAN-win-x64.zip" -Force
 Write-Host "Built: $dist/LiteLAN.exe"

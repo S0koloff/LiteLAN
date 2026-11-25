@@ -6,9 +6,12 @@ use std::{fs, path::PathBuf, process::{Child, Command, Stdio}, sync::mpsc::{self
 const BASE: &str = "http://127.0.0.1:18639/api/v0";
 type R<T> = Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String { e.to_string() }
-fn s<'a>(v: &'a Value, key: &str) -> &'a str { v[key].as_str().unwrap_or("") }
+fn normalize(v: Value) -> Value {
+ match v { Value::Object(m) => Value::Object(m.into_iter().map(|(k,v)|(k.to_ascii_lowercase(),normalize(v))).collect()), Value::Array(a)=>Value::Array(a.into_iter().map(normalize).collect()), x=>x }
+}
+fn s<'a>(v: &'a Value, key: &str) -> &'a str { v[key.to_ascii_lowercase()].as_str().unwrap_or("") }
 fn arr(v: &Value) -> &[Value] { v.as_array().map(Vec::as_slice).unwrap_or(&[]) }
-fn yes(v: &Value, key: &str) -> bool { v[key].as_bool().unwrap_or(false) }
+fn yes(v: &Value, key: &str) -> bool { v[key.to_ascii_lowercase()].as_bool().unwrap_or(false) }
 struct Api(reqwest::blocking::Client);
 impl Api {
  fn new() -> R<Self> { Ok(Self(reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(3)).build().map_err(err)?)) }
@@ -18,7 +21,7 @@ impl Api {
   let status = r.status(); let text = r.text().map_err(err)?;
   if !status.is_success() { return Err(format!("HTTP {status}: {text}")); } Ok(text)
  }
- fn get(&self, p: &str) -> R<Value> { serde_json::from_str(&self.call(p,None)?).map_err(err) }
+ fn get(&self, p: &str) -> R<Value> { serde_json::from_str(&self.call(p,None)?).map(normalize).map_err(err) }
  fn post(&self,p:&str,v:Value)->R<String>{self.call(p,Some(v))}
 }
 fn profile() -> R<PathBuf> { Ok(PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA missing")?).join("LiteLAN").join("profile")) }
@@ -45,7 +48,7 @@ fn start_core() -> R<Child> {
  #[cfg(windows)] cmd.creation_flags(0x08000000);
  cmd.spawn().map_err(err)
 }
-#[derive(Default)] struct Snapshot {me:Value, peers:Value, requests:Value}
+#[derive(Default)] struct Snapshot {me:Value, peers:Value, requests:Value,debug:Value}
 enum Job {Start,Stop,Invite,Add(String,String),Accept(String,String,bool),Rename(String),Logs,Exit}
 enum Event {State(String),Data(Snapshot),Invite(String),Logs(String),Error(String)}
 fn worker(rx:Receiver<Job>,tx:Sender<Event>,ctx:egui::Context){
@@ -56,14 +59,14 @@ fn worker(rx:Receiver<Job>,tx:Sender<Event>,ctx:egui::Context){
   match rx.recv_timeout(Duration::from_millis(200)) {
    Ok(Job::Exit)|Err(mpsc::RecvTimeoutError::Disconnected)=>{stop(&mut child);break},
    Ok(Job::Start)=>{if child.is_none(){
-    if std::net::TcpStream::connect_timeout(&"127.0.0.1:18639".parse().unwrap(),Duration::from_millis(300)).is_ok(){send(Event::Error("Port 18639 already in use. Close the other LiteLAN instance.".into()));}
-    else {match start_core(){Ok(c)=>{child=Some(c);started=Instant::now();next=Instant::now();send(Event::State("Starting core…".into()));},Err(e)=>send(Event::Error(e))}}
+    if std::net::TcpStream::connect_timeout(&"127.0.0.1:18639".parse().unwrap(),Duration::from_millis(300)).is_ok(){send(Event::State("Port already in use".into()));send(Event::Error("Port 18639 already in use. Close the other LiteLAN instance.".into()));}
+    else {match start_core(){Ok(c)=>{child=Some(c);started=Instant::now();next=Instant::now();send(Event::State("Starting core…".into()));},Err(e)=>{send(Event::State("Core failed to start".into()));send(Event::Error(e));}}}
    }},
    Ok(Job::Stop)=>{stop(&mut child);send(Event::State("Stopped".into()));send(Event::Data(Snapshot::default()));},
    Ok(Job::Logs)=>{let text=api.call("/debug/log?logs=100",None).or_else(|_|fs::read_to_string(profile()?.join("core.log")).map_err(err));match text{Ok(t)=>send(Event::Logs(t)),Err(e)=>send(Event::Error(e))}},
    Ok(job)=>{
     let res=match job {
-     Job::Invite=>api.post("/peers/invites/create",json!({"maxUses":1,"expiresInSeconds":86400,"allowUsingAsExitNode":false})).and_then(|t|{let v:Value=serde_json::from_str(&t).map_err(err)?;let link=s(&v,"link");if link.is_empty(){return Err("Invite response missing link".into())}send(Event::Invite(link.into()));Ok(String::new())}),
+     Job::Invite=>api.post("/peers/invites/create",json!({"maxUses":1,"expiresInSeconds":86400,"allowUsingAsExitNode":false})).and_then(|t|{let v=normalize(serde_json::from_str::<Value>(&t).map_err(err)?);let link=s(&v,"link");if link.is_empty(){return Err("Invite response missing link".into())}send(Event::Invite(link.into()));Ok(String::new())}),
      Job::Add(link,alias)=>parse_invite(&link,&alias).and_then(|v|api.post("/peers/invite_peer",v)),
      Job::Accept(id,alias,decline)=>api.post("/peers/accept_peer",json!({"peerID":id,"alias":alias,"decline":decline,"allowUsingAsExitNode":false})),
      Job::Rename(name)=>api.post("/settings/update",json!({"name":name})),
@@ -74,8 +77,8 @@ fn worker(rx:Receiver<Job>,tx:Sender<Event>,ctx:egui::Context){
   if let Some(c)=child.as_mut(){match c.try_wait(){Ok(Some(status))=>{child=None;send(Event::State(format!("Core exited: {status}. Open logs.")));send(Event::Data(Snapshot::default()));continue},Err(e)=>{send(Event::Error(err(e)));},_=>{}}}
   if child.is_some() && Instant::now()>=next{
    next=Instant::now()+Duration::from_secs(3);
-   match api.get("/settings/peer_info").and_then(|me|Ok(Snapshot{me,peers:api.get("/peers/get_known")?,requests:api.get("/peers/auth_requests")?})){
-    Ok(s)=>{send(Event::State("Core running".into()));send(Event::Data(s));},
+   match api.get("/settings/peer_info").and_then(|me|Ok(Snapshot{me,peers:api.get("/peers/get_known")?,requests:api.get("/peers/auth_requests")?,debug:api.get("/debug/p2p_info").unwrap_or(Value::Null)})){
+    Ok(s)=>{let ready=network_ready(&s);send(Event::State(if ready {"Network ready"} else {"Discovering network"}.into()));send(Event::Data(s));},
     Err(e)=>{send(Event::Data(Snapshot::default()));send(Event::State(format!("{}: {e}",if started.elapsed()<Duration::from_secs(20){"Starting"}else{"API unavailable — open logs"})));}
    }
   }
@@ -89,66 +92,69 @@ fn parse_invite(link:&str,alias:&str)->R<Value>{
  if id.is_empty(){return Err("Missing peer ID".into())} let alias=if !alias.trim().is_empty(){alias.trim().to_string()}else if !name.is_empty(){name}else{"Friend".into()};
  Ok(json!({"peerID":id,"alias":alias,"token":token,"allowUsingAsExitNode":false}))
 }
-struct App{tx:Sender<Job>,rx:Receiver<Event>,thread:Option<std::thread::JoinHandle<()>>,data:Snapshot,state:String,error:String,link:String,alias:String,invite:String,name:String,logs:Option<String>,page:usize,dark:bool}
+struct App{tx:Sender<Job>,rx:Receiver<Event>,thread:Option<std::thread::JoinHandle<()>>,data:Snapshot,state:String,error:String,link:String,alias:String,invite:String,name:String,logs:Option<String>,page:usize,dark:bool,scale:f32}
 impl App{
- fn new(cc:&eframe::CreationContext<'_>)->Self{let (tx,jobs)=mpsc::channel();let (events,rx)=mpsc::channel();let ctx=cc.egui_ctx.clone();let thread=std::thread::spawn(move||worker(jobs,events,ctx));let _=tx.send(Job::Start);Self{tx,rx,thread:Some(thread),data:Snapshot::default(),state:"Starting…".into(),error:String::new(),link:String::new(),alias:String::new(),invite:String::new(),name:String::new(),logs:None,page:0,dark:false}}
+ fn new(cc:&eframe::CreationContext<'_>)->Self{install_fonts(&cc.egui_ctx);let (tx,jobs)=mpsc::channel();let (events,rx)=mpsc::channel();let ctx=cc.egui_ctx.clone();let thread=std::thread::spawn(move||worker(jobs,events,ctx));let _=tx.send(Job::Start);Self{tx,rx,thread:Some(thread),data:Snapshot::default(),state:"Starting…".into(),error:String::new(),link:String::new(),alias:String::new(),invite:String::new(),name:String::new(),logs:None,page:0,dark:true,scale:1.0}}
  fn job(&mut self,j:Job){self.error.clear();let _=self.tx.send(j);}
 }
 impl Drop for App{fn drop(&mut self){let _=self.tx.send(Job::Exit);if let Some(t)=self.thread.take(){let _=t.join();}}}
+fn network_ready(d:&Snapshot)->bool {
+ yes(&d.me["vpn"],"vpninterfaceenabled") && !s(&d.me["vpn"],"ipnet").is_empty() && d.me["connectedbootstrappeers"].as_u64().unwrap_or(0)>0
+}
+fn install_fonts(ctx:&egui::Context){
+ let mut fonts=egui::FontDefinitions::default();
+ if let Some(root)=std::env::var_os("WINDIR") {if let Ok(bytes)=fs::read(PathBuf::from(root).join("Fonts").join("segoeui.ttf")) {fonts.font_data.insert("system-ui".into(),egui::FontData::from_owned(bytes).into());fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0,"system-ui".into());}}
+ ctx.set_fonts(fonts);
+}
+fn c(r:u8,g:u8,b:u8)->Color32{Color32::from_rgb(r,g,b)}
 fn theme(ctx:&egui::Context,dark:bool){
- let mut style=(*ctx.style()).clone();
- let mut v=if dark{egui::Visuals::dark()}else{egui::Visuals::light()};
- let (bg,panel,ink,accent,hover)=if dark{(Color32::from_rgb(23,25,33),Color32::from_rgb(32,35,45),Color32::from_rgb(225,229,240),Color32::from_rgb(62,79,122),Color32::from_rgb(48,54,70))}else{(Color32::from_rgb(248,247,252),Color32::from_rgb(239,240,248),Color32::from_rgb(32,36,52),Color32::from_rgb(216,225,250),Color32::from_rgb(229,232,246))};
- v.panel_fill=bg;v.window_fill=panel;v.override_text_color=Some(ink);v.selection.bg_fill=accent;
- v.widgets.inactive.bg_fill=panel;v.widgets.inactive.weak_bg_fill=panel;
- v.widgets.hovered.bg_fill=hover;v.widgets.hovered.weak_bg_fill=hover;
- v.widgets.active.bg_fill=accent;v.widgets.active.weak_bg_fill=accent;
- for w in [&mut v.widgets.inactive,&mut v.widgets.hovered,&mut v.widgets.active]{w.corner_radius=egui::CornerRadius::same(8);w.bg_stroke=egui::Stroke::NONE;}
- style.visuals=v;style.spacing.item_spacing=egui::vec2(10.,9.);style.spacing.button_padding=egui::vec2(12.,7.);
- style.text_styles.insert(egui::TextStyle::Body,egui::FontId::proportional(14.));style.text_styles.insert(egui::TextStyle::Button,egui::FontId::proportional(14.));style.text_styles.insert(egui::TextStyle::Heading,egui::FontId::proportional(23.));ctx.set_style(style);
+ let mut style=(*ctx.style()).clone();let mut v=if dark{egui::Visuals::dark()}else{egui::Visuals::light()};
+ let (bg,panel,ink,sub,stroke,hover)=if dark{(c(17,20,27),c(24,29,39),c(235,239,247),c(148,160,178),c(43,51,65),c(35,45,61))}else{(c(245,247,251),Color32::WHITE,c(24,34,49),c(94,108,130),c(221,227,237),c(232,239,250))};
+ v.panel_fill=bg;v.window_fill=panel;v.override_text_color=None;v.widgets.noninteractive.fg_stroke.color=ink;v.widgets.noninteractive.bg_stroke.color=stroke;v.widgets.noninteractive.weak_bg_fill=panel;v.selection.bg_fill=c(44,92,169);v.selection.stroke.color=Color32::WHITE;
+ for w in [&mut v.widgets.inactive,&mut v.widgets.hovered,&mut v.widgets.active]{w.corner_radius=egui::CornerRadius::same(8);w.bg_stroke=egui::Stroke::new(1.,stroke);w.fg_stroke.color=ink;w.bg_fill=panel;w.weak_bg_fill=panel;}
+ v.widgets.hovered.bg_fill=hover;v.widgets.hovered.weak_bg_fill=hover;v.widgets.active.bg_fill=hover;v.widgets.active.weak_bg_fill=hover;let _ = sub;
+ style.visuals=v;style.spacing.item_spacing=egui::vec2(12.,10.);style.spacing.button_padding=egui::vec2(16.,9.);style.spacing.interact_size=egui::vec2(42.,36.);
+ for (t,z) in [(egui::TextStyle::Body,15.),(egui::TextStyle::Button,15.),(egui::TextStyle::Heading,26.),(egui::TextStyle::Small,12.)]{style.text_styles.insert(t,egui::FontId::proportional(z));}ctx.set_style(style);
 }
-fn surface(ui:&mut egui::Ui, f:impl FnOnce(&mut egui::Ui)){
- egui::Frame::new().fill(ui.visuals().widgets.inactive.bg_fill).corner_radius(12).inner_margin(16).show(ui,f);
-}
-fn primary(ui:&mut egui::Ui,label:&str)->bool{ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(Color32::from_rgb(65,92,175)).corner_radius(8)).clicked()}
-fn muted(ui:&mut egui::Ui,t:impl Into<String>){ui.label(RichText::new(t.into()).size(12.).weak());}
+fn surface(ui:&mut egui::Ui,f:impl FnOnce(&mut egui::Ui)) {egui::Frame::new().fill(ui.visuals().window_fill).stroke(egui::Stroke::new(1.,ui.visuals().widgets.noninteractive.bg_stroke.color)).corner_radius(12).inner_margin(18).show(ui,f);}
+fn primary(ui:&mut egui::Ui,label:&str)->bool{ui.add(egui::Button::new(RichText::new(label).color(Color32::WHITE).strong()).fill(c(48,105,204)).stroke(egui::Stroke::NONE).corner_radius(8)).clicked()}
+fn muted(ui:&mut egui::Ui,t:impl Into<String>){ui.label(RichText::new(t.into()).size(13.).weak());}
+fn dot(ui:&mut egui::Ui,active:bool,pulse:bool){let (r,_)=ui.allocate_exact_size(egui::vec2(22.,22.),egui::Sense::hover());let color=if active{c(39,192,129)}else{c(133,143,158)};if active&&pulse{let t=(ui.input(|i|i.time)*0.65).fract() as f32;ui.painter().circle_filled(r.center(),5.+7.*t,color.gamma_multiply((1.-t)*0.35));ui.ctx().request_repaint_after(Duration::from_millis(50));}ui.painter().circle_filled(r.center(),4.5,color);}
+fn glyph(ui:&mut egui::Ui,i:usize,color:Color32){let (r,_)=ui.allocate_exact_size(egui::vec2(20.,20.),egui::Sense::hover());let p=ui.painter();let st=egui::Stroke::new(1.6,color);let at=|x:f32,y:f32|r.min+egui::vec2(x,y);match i {0=>{for (x,y) in [(2.,2.),(11.,2.),(2.,11.),(11.,11.)]{p.rect_stroke(egui::Rect::from_min_size(at(x,y),egui::vec2(7.,7.)),2,st,egui::StrokeKind::Inside);}},1=>{p.circle_stroke(at(7.,6.),4.,st);p.line_segment([at(2.,17.),at(2.,13.)],st);p.line_segment([at(2.,13.),at(12.,13.)],st);p.line_segment([at(15.,5.),at(15.,13.)],st);p.line_segment([at(11.,9.),at(19.,9.)],st);},2=>{for y in [4.,10.,16.]{p.line_segment([at(2.,y),at(18.,y)],st);p.circle_filled(at(if y==10.{13.}else{7.},y),2.5,color);}},_=>{p.rect_stroke(egui::Rect::from_min_max(at(2.,3.),at(18.,17.)),3,st,egui::StrokeKind::Inside);p.line_segment([at(5.,7.),at(9.,10.)],st);p.line_segment([at(9.,10.),at(5.,13.)],st);p.line_segment([at(11.,13.),at(15.,13.)],st);}}}
+fn num(v:&Value)->String{v.as_u64().map(|n|n.to_string()).unwrap_or_else(||"—".into())}
+fn rate(v:&Value,k:&str)->String{let x=s(v,k);if x.is_empty(){"—".into()}else{x.into()}}
+fn ping(p:&Value)->String{p["ping"].as_u64().filter(|n|*n>0).map(|n|format!("{:.0} ms",n as f64/1_000_000.)).unwrap_or_else(||"—".into())}
+fn route(p:&Value)->&'static str{if !yes(p,"connected"){return "Offline"}let con=arr(&p["connections"]);if con.iter().any(|c|c["throughrelay"].as_bool()==Some(false)&&!yes(c,"transient")){"Direct"}else if con.iter().any(|c|yes(c,"throughrelay")){"Relay"}else{"Connected"}}
 impl eframe::App for App{
  fn update(&mut self,ctx:&egui::Context,_:&mut eframe::Frame){
   while let Ok(e)=self.rx.try_recv(){match e{Event::State(s)=>self.state=s,Event::Data(d)=>self.data=d,Event::Error(e)=>self.error=e,Event::Invite(i)=>{ctx.copy_text(i.clone());self.invite=i;},Event::Logs(l)=>self.logs=Some(l)}}
-  theme(ctx,self.dark);
-  let ready=self.data.me.is_object();let ip=s(&self.data.me["vpn"],"ipnet").split('/').next().unwrap_or("").to_string();
-  let online=arr(&self.data.peers).iter().filter(|p|yes(p,"connected")).count();let total=arr(&self.data.peers).len();
-  egui::SidePanel::left("navigation").resizable(false).exact_width(174.).frame(egui::Frame::new().fill(ctx.style().visuals.widgets.inactive.bg_fill).inner_margin(12)).show(ctx,|ui|{
-   ui.add_space(8.);ui.label(RichText::new("LiteLAN").size(25.).strong());muted(ui,"Private mesh network");ui.add_space(22.);
-   for (i,label) in ["Overview","Invitations","Settings","Diagnostics"].iter().enumerate(){if ui.add_sized([150.,38.],egui::Button::new(*label).selected(self.page==i)).clicked(){self.page=i;}}
-   ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT),|ui|{muted(ui,"LiteLAN • AWL 0.21");ui.checkbox(&mut self.dark,"Dark appearance");});
+  theme(ctx,self.dark);if (ctx.zoom_factor()-self.scale).abs()>0.01 {ctx.set_zoom_factor(self.scale);}
+  let ready=network_ready(&self.data);let api=self.data.me.is_object();let ip=s(&self.data.me["vpn"],"ipnet").split('/').next().unwrap_or("").to_string();let online=arr(&self.data.peers).iter().filter(|p|yes(p,"connected")).count();let total=arr(&self.data.peers).len();
+  let boot=format!("{} / {}",num(&self.data.me["connectedbootstrappeers"]),num(&self.data.me["totalbootstrappeers"]));let dht=num(&self.data.debug["dht"]["routingtablesize"]);let stats=&self.data.me["networkstatsiniecunits"];let rx=rate(stats,"ratein");let tx=rate(stats,"rateout");
+  let active=api||self.state.starts_with("Starting")||self.state.starts_with("API unavailable");
+  egui::SidePanel::left("nav").resizable(false).exact_width(208.).frame(egui::Frame::new().fill(ctx.style().visuals.window_fill).inner_margin(16)).show(ctx,|ui|{
+   ui.add_space(10.);ui.horizontal(|ui|{let (r,_)=ui.allocate_exact_size(egui::vec2(34.,34.),egui::Sense::hover());ui.painter().rect_filled(r,9,c(48,105,204));for (x,y) in [(9.,9.),(25.,9.),(17.,25.)]{ui.painter().circle_filled(r.min+egui::vec2(x,y),3.,Color32::WHITE);}for (a,b) in [(egui::vec2(9.,9.),egui::vec2(17.,25.)),(egui::vec2(25.,9.),egui::vec2(17.,25.))]{ui.painter().line_segment([r.min+a,r.min+b],egui::Stroke::new(1.7,Color32::WHITE));}ui.label(RichText::new("LiteLAN").size(23.).strong());});muted(ui,"PRIVATE NETWORK");ui.add_space(24.);
+   for (i,label) in ["Overview","Invitations","Settings","Diagnostics"].iter().enumerate(){let selected=self.page==i;let (r,response)=ui.allocate_exact_size(egui::vec2(ui.available_width(),44.),egui::Sense::click());let color=if selected{if self.dark{c(106,163,255)}else{c(34,86,174)}}else{ui.visuals().text_color()};if selected||response.hovered(){ui.painter().rect_filled(r,8,if self.dark{c(31,46,70)}else{c(221,234,255)});}ui.scope_builder(egui::UiBuilder::new().max_rect(r.shrink(9.)),|ui|{ui.horizontal(|ui|{glyph(ui,i,color);ui.label(RichText::new(*label).color(if selected&&!self.dark{c(34,86,174)}else{color}));});});if response.clicked(){self.page=i;}}
+   ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT),|ui|{muted(ui,"LiteLAN 0.1.2 · AWL 0.21");ui.checkbox(&mut self.dark,"Dark appearance");});
   });
-  egui::TopBottomPanel::bottom("status").show(ctx,|ui|{ui.horizontal(|ui|{ui.colored_label(if ready{Color32::from_rgb(38,155,93)}else{Color32::GRAY},"●");ui.label(if ready{"Core running"}else{"Core not ready"});ui.separator();muted(ui,format!("{online}/{total} peers online"));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{muted(ui,"Local API · No exit node");});});});
-  egui::CentralPanel::default().frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill).inner_margin(22)).show(ctx,|ui|{
-   egui::ScrollArea::vertical().show(ui,|ui|{
-    if !self.error.is_empty(){ui.colored_label(Color32::from_rgb(210,76,76),&self.error);}
-    match self.page{
-     0=>{
-      ui.horizontal(|ui|{ui.heading("Overview");ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.add_enabled(ready,egui::Button::new("+ Add peer")).clicked(){self.page=1;}});});
-      muted(ui,"Your devices and private network");ui.add_space(10.);
-      ui.columns(2,|cols|{
-       cols[0].heading("Peers");muted(&mut cols[0],format!("{online} of {total} online"));cols[0].add_space(8.);
-       if total==0{surface(&mut cols[0],|ui|{ui.set_min_height(120.);ui.label(RichText::new("No peers yet").strong());muted(ui,"Share an invitation to connect another computer.");if ui.add_enabled(ready,egui::Button::new("Add your first peer")).clicked(){self.page=1;}});}
-       for p in arr(&self.data.peers){let live=yes(p,"connected");let con=arr(&p["connections"]);let route=if !live{"Offline"}else if con.iter().any(|c|!yes(c,"throughRelay")){"Direct available"}else if !con.is_empty(){"Relay"}else{"Connected"};surface(&mut cols[0],|ui|{ui.horizontal(|ui|{ui.colored_label(if live{Color32::from_rgb(38,155,93)}else{Color32::GRAY},"●");ui.label(RichText::new(s(p,"alias")).strong());});muted(ui,route);ui.separator();muted(ui,"VPN address");ui.horizontal(|ui|{ui.label(s(p,"ipAddr"));if !s(p,"ipAddr").is_empty()&&ui.small_button("Copy").clicked(){ctx.copy_text(s(p,"ipAddr").into());}});if !live{muted(ui,s(&p["reconnect"],"lastError"));}});cols[0].add_space(4.);}
-       cols[1].heading("This device");muted(&mut cols[1],if ready{s(&self.data.me,"name")}else{"Not connected"});cols[1].add_space(8.);
-       surface(&mut cols[1],|ui|{muted(ui,"Virtual IP address");ui.label(RichText::new(if ip.is_empty(){"—"}else{&ip}).size(25.).strong());if !ip.is_empty()&&ui.button("Copy address").clicked(){ctx.copy_text(ip.clone());}ui.separator();muted(ui,"Network status");ui.label(&self.state);if ready{muted(ui,format!("Bootstrap nodes: {} / {}",self.data.me["connectedBootstrapPeers"],self.data.me["totalBootstrapPeers"]));}ui.horizontal(|ui|{if ready{if ui.button("Disconnect").clicked(){self.job(Job::Stop);}}else if primary(ui,"Connect"){self.job(Job::Start);}});});
-       cols[1].add_space(8.);surface(&mut cols[1],|ui|{ui.label(RichText::new("Network mode").strong());muted(ui,"Private LAN only");ui.label("Internet routing unchanged");});
-      });
-      let requests=arr(&self.data.requests).to_vec();if !requests.is_empty(){ui.add_space(12.);ui.heading("Incoming requests");for r in requests{surface(ui,|ui|{let name=s(&r,"name");let id=s(&r,"peerID");ui.label(if name.is_empty(){id}else{name});ui.horizontal(|ui|{if primary(ui,"Accept"){self.job(Job::Accept(id.into(),if name.is_empty(){"Friend".into()}else{name.into()},false));}if ui.button("Decline").clicked(){self.job(Job::Accept(id.into(),String::new(),true));}});});}}
-     },
-     1=>{ui.heading("Invitations");muted(ui,"Connect a friend to your private network");ui.add_space(12.);ui.add_enabled_ui(ready,|ui|{surface(ui,|ui|{ui.label(RichText::new("Invite a friend").size(18.).strong());muted(ui,"Single-use link, valid for 24 hours.");if primary(ui,"Create & copy invitation"){self.job(Job::Invite);}if !self.invite.is_empty(){ui.label("Invitation copied. Share it privately.");if ui.button("Copy again").clicked(){ctx.copy_text(self.invite.clone());}}});ui.add_space(10.);surface(ui,|ui|{ui.label(RichText::new("Join a friend").size(18.).strong());muted(ui,"Invitation link");ui.add(egui::TextEdit::singleline(&mut self.link).hint_text("awl://invite?...").desired_width(f32::INFINITY));muted(ui,"Device alias (optional)");ui.add(egui::TextEdit::singleline(&mut self.alias).desired_width(f32::INFINITY));if primary(ui,"Add peer"){self.job(Job::Add(self.link.clone(),self.alias.clone()));}});});if !ready{muted(ui,"Connect the network before creating or accepting invitations.");}},
-     2=>{ui.heading("Settings");ui.add_space(12.);surface(ui,|ui|{ui.label(RichText::new("Device name").strong());ui.add_enabled_ui(ready,|ui|{ui.horizontal(|ui|{ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("New device name"));if primary(ui,"Save")&&!self.name.trim().is_empty(){self.job(Job::Rename(self.name.trim().into()));}});});ui.separator();ui.checkbox(&mut self.dark,"Dark appearance");});ui.add_space(10.);surface(ui,|ui|{ui.label(RichText::new("Network configuration").strong());for t in ["Virtual adapter: litelan0","Local API: 127.0.0.1:18639","SOCKS5: disabled","DNS: disabled","Exit node: disabled"]{ui.label(t);}});},
-     _=>{ui.heading("Diagnostics");muted(ui,"Inspect the network core and connection state");ui.add_space(12.);surface(ui,|ui|{ui.label(&self.state);ui.horizontal(|ui|{if ui.button("Start").clicked(){self.job(Job::Start);}if ui.button("Stop").clicked(){self.job(Job::Stop);}if primary(ui,"View core logs"){self.job(Job::Logs);}});});}
-    }
-   });
-  });
-  if let Some(log)=self.logs.as_mut(){let mut open=true;egui::Window::new("Core logs").open(&mut open).resizable(true).show(ctx,|ui|{if ui.button("Copy logs").clicked(){ctx.copy_text(log.clone());}egui::ScrollArea::vertical().max_height(450.).show(ui,|ui|{ui.add(egui::TextEdit::multiline(log).font(egui::TextStyle::Monospace).desired_width(600.));});});if !open{self.logs=None;}}
+  egui::TopBottomPanel::bottom("status").frame(egui::Frame::new().fill(ctx.style().visuals.window_fill).inner_margin(10)).show(ctx,|ui|{ui.horizontal(|ui|{dot(ui,ready,false);ui.label(if ready{"Network ready"}else{"Not ready"});ui.separator();muted(ui,format!("{online}/{total} peers online"));ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{muted(ui,"Local API · Private LAN");});});});
+  egui::CentralPanel::default().frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill).inner_margin(24)).show(ctx,|ui|{egui::ScrollArea::vertical().show(ui,|ui|{
+   if !self.error.is_empty(){ui.colored_label(c(229,105,105),&self.error);}
+   match self.page {
+    0=>{ui.horizontal(|ui|{ui.heading("Overview");ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{ui.add_enabled_ui(api,|ui|{if primary(ui,"+ Add peer"){self.page=1;}});});});muted(ui,"Manage your private multiplayer network");ui.add_space(10.);
+     surface(ui,|ui|{ui.horizontal(|ui|{dot(ui,ready,true);ui.label(RichText::new(if ready{"Network ready"}else if active{"Connecting"}else{"Disconnected"}).size(19.).strong());ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if active{if ui.button("Disconnect").clicked(){self.job(Job::Stop);}}else if primary(ui,"Connect"){self.job(Job::Start);}});});muted(ui,self.state.clone());ui.add_space(5.);ui.separator();ui.columns(3,|cols|{muted(&mut cols[0],"VIRTUAL IP");cols[0].label(RichText::new(if ip.is_empty(){"—"}else{&ip}).size(21.).strong());if !ip.is_empty()&&cols[0].small_button("Copy IP").clicked(){ctx.copy_text(ip.clone());}muted(&mut cols[1],"BOOTSTRAP NODES");cols[1].label(RichText::new(&boot).size(24.).strong());muted(&mut cols[2],"DHT ROUTING TABLE");cols[2].label(RichText::new(&dht).size(24.).strong());});});
+     ui.add_space(8.);ui.horizontal(|ui|{ui.label(RichText::new("Devices").size(20.).strong());muted(ui,format!("{online} online / {total} total"));});
+     surface(ui,|ui|{ui.columns(4,|cols|{for (col,title) in cols.iter_mut().zip(["DEVICE","VIRTUAL IP","CONNECTION","LATENCY"]){muted(col,title);}});ui.separator();if total==0{ui.add_space(18.);ui.vertical_centered(|ui|{ui.label(RichText::new("Your network is empty").size(18.).strong());muted(ui,"Invite a friend to start playing together.");ui.add_enabled_ui(api,|ui|{if primary(ui,"Invite a friend"){self.page=1;}});});ui.add_space(18.);}else{for p in arr(&self.data.peers){ui.columns(4,|cols|{cols[0].horizontal(|ui|{dot(ui,yes(p,"connected"),false);ui.label(s(p,"alias"));});cols[1].horizontal(|ui|{ui.label(s(p,"ipaddr"));if !s(p,"ipaddr").is_empty()&&ui.small_button("Copy").clicked(){ctx.copy_text(s(p,"ipaddr").into());}});cols[2].label(route(p));cols[3].label(ping(p));});ui.separator();}}});
+     ui.add_space(6.);ui.columns(2,|cols|{surface(&mut cols[0],|ui|{muted(ui,"NETWORK DOWNLOAD");ui.label(RichText::new(&rx).size(22.).strong());});surface(&mut cols[1],|ui|{muted(ui,"NETWORK UPLOAD");ui.label(RichText::new(&tx).size(22.).strong());});});
+     for r in arr(&self.data.requests).to_vec(){surface(ui,|ui|{let id=s(&r,"peerid");let name=s(&r,"name");ui.label(format!("Incoming request: {}",if name.is_empty(){id}else{name}));ui.horizontal(|ui|{if primary(ui,"Accept"){self.job(Job::Accept(id.into(),if name.is_empty(){"Friend".into()}else{name.into()},false));}if ui.button("Decline").clicked(){self.job(Job::Accept(id.into(),String::new(),true));}});});}
+    },
+    1=>{ui.heading("Invitations");muted(ui,"Connect a friend to your network");ui.add_space(12.);ui.add_enabled_ui(api,|ui|{surface(ui,|ui|{ui.label(RichText::new("Create invitation").size(19.).strong());muted(ui,"Single-use link, valid for 24 hours.");if primary(ui,"Create & copy invitation"){self.job(Job::Invite);}if !self.invite.is_empty(){ui.label("Invitation copied. Share it privately.");if ui.button("Copy again").clicked(){ctx.copy_text(self.invite.clone());}}});surface(ui,|ui|{ui.label(RichText::new("Join a friend").size(19.).strong());muted(ui,"Invitation link");ui.add(egui::TextEdit::singleline(&mut self.link).hint_text("awl://invite?…").desired_width(f32::INFINITY));muted(ui,"Device alias (optional)");ui.add(egui::TextEdit::singleline(&mut self.alias).desired_width(f32::INFINITY));if primary(ui,"Add peer"){self.job(Job::Add(self.link.clone(),self.alias.clone()));}});});},
+    2=>{ui.heading("Settings");surface(ui,|ui|{ui.label(RichText::new("Appearance").size(19.).strong());ui.checkbox(&mut self.dark,"Dark appearance");ui.add(egui::Slider::new(&mut self.scale,0.85..=1.5).step_by(0.05).text("UI scale"));if ui.button("Reset scale").clicked(){self.scale=1.;}});surface(ui,|ui|{ui.label(RichText::new("Device name").strong());ui.add_enabled_ui(api,|ui|{ui.horizontal(|ui|{ui.text_edit_singleline(&mut self.name);if primary(ui,"Save")&&!self.name.trim().is_empty(){self.job(Job::Rename(self.name.trim().into()));}});});muted(ui,"Private LAN only · No DNS, SOCKS5 or exit node");});},
+    _=>{ui.heading("Diagnostics");surface(ui,|ui|{ui.label(&self.state);ui.label(format!("Bootstrap: {boot} · DHT: {dht}"));ui.label(format!("Adapter: {}",if yes(&self.data.me["vpn"],"vpninterfaceenabled"){"Enabled"}else{"Unavailable"}));ui.horizontal(|ui|{if ui.button("Start").clicked(){self.job(Job::Start);}if ui.button("Stop").clicked(){self.job(Job::Stop);}if primary(ui,"View core logs"){self.job(Job::Logs);}});});}
+   }
+  });});
+  if let Some(log)=self.logs.as_mut(){let mut open=true;egui::Window::new("Core logs").open(&mut open).resizable(true).show(ctx,|ui|{if ui.button("Copy logs").clicked(){ctx.copy_text(log.clone());}egui::ScrollArea::vertical().max_height(450.).show(ui,|ui|{ui.add(egui::TextEdit::multiline(log).font(egui::TextStyle::Monospace).desired_width(650.));});});if !open{self.logs=None;}}
  }
 }
-fn main()->eframe::Result<()> {eframe::run_native("LiteLAN",eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size([940.,640.]).with_min_inner_size([780.,520.]),..Default::default()},Box::new(|cc|Ok(Box::new(App::new(cc))))) }
-#[cfg(test)] mod tests{use super::*;#[test]fn parses_link(){let v=parse_invite("awl://invite?p=abc&n=My%20PC&t=secret","").unwrap();assert_eq!(v["peerID"],"abc");assert_eq!(v["alias"],"My PC");assert_eq!(v["token"],"secret");}#[test]fn rejects_http(){assert!(parse_invite("https://example.com","x").is_err());}}
+fn main()->eframe::Result<()> {eframe::run_native("LiteLAN",eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size([1100.,750.]).with_min_inner_size([960.,650.]),..Default::default()},Box::new(|cc|Ok(Box::new(App::new(cc))))) }
+#[cfg(test)] mod tests{use super::*;#[test]fn parses_link(){let v=parse_invite("awl://invite?p=abc&n=My%20PC&t=secret","").unwrap();assert_eq!(v["peerID"],"abc");assert_eq!(v["alias"],"My PC");assert_eq!(v["token"],"secret");}#[test]fn rejects_http(){assert!(parse_invite("https://example.com","x").is_err());}#[test]fn go_json(){let me=normalize(json!({"VPN":{"IPNet":"10.64.160.184/11","VPNInterfaceEnabled":true},"ConnectedBootstrapPeers":4}));assert!(network_ready(&Snapshot{me,..Default::default()}));assert_eq!(ping(&normalize(json!({"Ping":18000000}))),"18 ms");assert_eq!(route(&normalize(json!({"Connected":true,"Connections":[{"ThroughRelay":false}]}))),"Direct");}}
