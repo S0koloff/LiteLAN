@@ -1,3 +1,4 @@
+param([switch]$OriginalCore)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw 'Install Rust via https://rustup.rs/ and Visual Studio Build Tools (Desktop development with C++), then reopen terminal.' }
@@ -22,6 +23,11 @@ $dist = Join-Path $PSScriptRoot 'dist'
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force "$dist/core" | Out-Null
 Copy-Item "$($exe.Directory.FullName)\*" "$dist/core" -Recurse -Force
+if (!$OriginalCore) {
+  & (Join-Path $PSScriptRoot 'patches/build-core.ps1') -OutputExe (Join-Path $dist 'core/awl.exe')
+  Copy-Item (Join-Path $cache 'awl-source-v0.21.0/LICENSE') (Join-Path $dist 'core/AWL-LICENSE.txt') -Force
+  Copy-Item (Join-Path $PSScriptRoot 'patches/apply-auth-retry.ps1') (Join-Path $dist 'core/apply-auth-retry.ps1') -Force
+}
 Copy-Item 'target/x86_64-pc-windows-msvc/release/litelan.exe' "$dist/LiteLAN.exe" -Force
 Copy-Item README.md,THIRD_PARTY.md "$dist/" -Force
 Compress-Archive -Path "$dist/*" -DestinationPath "$PSScriptRoot/LiteLAN-win-x64.zip" -Force
