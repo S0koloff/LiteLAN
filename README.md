@@ -24,7 +24,7 @@ No browser window, no account, and no self-hosted server required. Connections u
 <p align="center">
   <img src="assets/LiteLAN%20Network%20Overview.png" width="420" alt="LiteLAN v0.1.11 Overview showing network status, virtual IP and connected devices">
   <br>
-  <em>LiteLAN v0.1.11 · Network Overview</em>
+  <em>LiteLAN v0.1.17 · Network Overview</em>
 </p>
 
 ## Features
@@ -77,12 +77,6 @@ The build script downloads the upstream AnywhereLAN core, verifies its published
 | Core communication | Local HTTP API, bypassing system proxy |
 
 LiteLAN uses a separate configuration profile and does not intentionally modify system proxy settings. Avoid running another AnywhereLAN instance alongside LiteLAN.
-
-## Project status
-
-LiteLAN is in early development. Windows builds are available, but real-world peer connectivity, resource usage and compatibility with other VPN clients still require testing. Connectivity depends on upstream discovery and relay availability. Automatic adapter cleanup, graceful core shutdown and system tray support are not yet implemented.
-
-If you encounter a connection issue, open **Logs** in the application and include relevant diagnostics in an [issue report](https://github.com/S0koloff/LiteLAN/issues). Remove private keys, invitation links and personal information before sharing logs.
 
 ## Credits
 
