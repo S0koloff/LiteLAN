@@ -29,6 +29,8 @@ if (!$OriginalCore) {
   Copy-Item (Join-Path $PSScriptRoot 'patches/apply-auth-retry.ps1') (Join-Path $dist 'core/apply-auth-retry.ps1') -Force
 }
 Copy-Item 'target/x86_64-pc-windows-msvc/release/litelan.exe' "$dist/LiteLAN.exe" -Force
-Copy-Item README.md,THIRD_PARTY.md "$dist/" -Force
+Copy-Item README.md "$dist/" -Force
+New-Item -ItemType Directory -Force "$dist/assets" | Out-Null
+Copy-Item -LiteralPath 'assets/LiteLAN Network Overview.png' -Destination "$dist/assets/" -Force
 Compress-Archive -Path "$dist/*" -DestinationPath "$PSScriptRoot/LiteLAN-win-x64.zip" -Force
 Write-Host "Built: $dist/LiteLAN.exe"

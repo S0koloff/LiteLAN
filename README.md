@@ -21,6 +21,12 @@ LiteLAN brings a standalone desktop interface to [AnywhereLAN](https://github.co
 
 No browser window, no account, and no self-hosted server required. Connections use AnywhereLAN's peer-to-peer networking and relay infrastructure when available.
 
+<p align="center">
+  <img src="assets/LiteLAN%20Network%20Overview.png" width="420" alt="LiteLAN v0.1.11 Overview showing network status, virtual IP and connected devices">
+  <br>
+  <em>LiteLAN v0.1.11 · Network Overview</em>
+</p>
+
 ## Features
 
 - **Native desktop UI** — Rust and egui, without Electron or WebView.
@@ -80,7 +86,11 @@ If you encounter a connection issue, open **Logs** in the application and includ
 
 ## Credits
 
-LiteLAN is an independent frontend for [AnywhereLAN](https://github.com/anywherelan/awl), not an official AnywhereLAN release. The bundled upstream core is distributed under the MPL-2.0 license. See [THIRD_PARTY.md](THIRD_PARTY.md) for details.
+LiteLAN is an independent frontend for [AnywhereLAN](https://github.com/anywherelan/awl), not an official AnywhereLAN release.
+
+- The default build bundles a core built from the [AnywhereLAN v0.21.0 source](https://github.com/anywherelan/awl/tree/v0.21.0) under the [MPL-2.0 license](https://github.com/anywherelan/awl/blob/v0.21.0/LICENSE), with a local patch for outgoing authorization retries and retry/cancel API actions. The patch does not change transport, Wintun, routing, encryption, or approval policy.
+- To reproduce the modified core, see [`patches/build-core.ps1`](patches/build-core.ps1) and [`patches/apply-auth-retry.ps1`](patches/apply-auth-retry.ps1). The release archive also includes the patch alongside the core. `build.ps1 -OriginalCore` uses the unchanged upstream binary for diagnosis; manual Retry and Cancel require the patched core.
+- The bundle includes the official [Wintun 0.14.1](https://www.wintun.net/) Windows AMD64 DLL. Rust dependencies are listed in [`Cargo.toml`](Cargo.toml) and are covered by their respective licenses.
 
 <div align="center">
 
