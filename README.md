@@ -24,7 +24,7 @@ No browser window, no account, and no self-hosted server required. Connections u
 <p align="center">
   <img src="assets/LiteLAN%20Network%20Overview.png" width="420" alt="LiteLAN v0.1.11 Overview showing network status, virtual IP and connected devices">
   <br>
-  <em>LiteLAN v0.1.17 · Network Overview</em>
+  <em>LiteLAN v0.1.11 · Network Overview</em>
 </p>
 
 ## Features
