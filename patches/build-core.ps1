@@ -7,6 +7,7 @@ if (Test-Path $source) { Remove-Item $source -Recurse -Force }
 git clone --depth 1 --branch v0.21.0 https://github.com/anywherelan/awl.git $source
 if ($LASTEXITCODE -ne 0) { throw 'AWL source checkout failed' }
 & (Join-Path $PSScriptRoot 'apply-auth-retry.ps1') -SourceDir $source
+& (Join-Path $PSScriptRoot 'apply-invite-routes.ps1') -SourceDir $source
 # Upstream embeds its web assets; LiteLAN has its own native frontend.
 New-Item -ItemType Directory -Force (Join-Path $source 'static') | Out-Null
 if (!(Test-Path (Join-Path $source 'static/index.html'))) {
@@ -22,8 +23,10 @@ $env:GOOS = 'windows'
 $env:GOARCH = 'amd64'
 Push-Location $source
 try {
-  gofmt -w service/auth_status.go api/api.go api/litelan.go
+  gofmt -w service/auth_status.go api/api.go api/litelan.go p2p/p2p.go p2p/litelan_invite_routes.go api/litelan_invite_routes.go p2p/litelan_invite_routes_test.go
   if ($LASTEXITCODE -ne 0) { throw 'AWL patch formatting failed' }
+  go test ./p2p -run '^TestLiteInvite' -count=1
+  if ($LASTEXITCODE -ne 0) { throw 'Invitation route tests failed' }
   go build -trimpath -ldflags '-buildid= -s -w -H windowsgui -X github.com/anywherelan/awl/config.Version=v0.21.0' -o $OutputExe ./cmd/awl
   if ($LASTEXITCODE -ne 0) { throw 'Patched AWL build failed' }
 } finally { Pop-Location }

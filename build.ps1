@@ -22,15 +22,22 @@ if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 $dist = Join-Path $PSScriptRoot 'dist'
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force "$dist/core" | Out-Null
-Copy-Item "$($exe.Directory.FullName)\*" "$dist/core" -Recurse -Force
+# Stage only the runtime and upstream legal notices, not the whole archive.
+Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $dist 'core/awl.exe') -Force
+Get-ChildItem -LiteralPath $exe.Directory.FullName -File | Where-Object {
+  $_.Extension -ieq '.dll' -or $_.Name -match '^(LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT|THIRD[_ -]?PARTY)([._ -].*)?$'
+} | ForEach-Object {
+  Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dist 'core') -Force
+}
 if (!$OriginalCore) {
   & (Join-Path $PSScriptRoot 'patches/build-core.ps1') -OutputExe (Join-Path $dist 'core/awl.exe')
   Copy-Item (Join-Path $cache 'awl-source-v0.21.0/LICENSE') (Join-Path $dist 'core/AWL-LICENSE.txt') -Force
   Copy-Item (Join-Path $PSScriptRoot 'patches/apply-auth-retry.ps1') (Join-Path $dist 'core/apply-auth-retry.ps1') -Force
+  Copy-Item (Join-Path $PSScriptRoot 'patches/apply-invite-routes.ps1') (Join-Path $dist 'core/apply-invite-routes.ps1') -Force
+  Copy-Item (Join-Path $PSScriptRoot 'patches/litelan_invite_*.go') (Join-Path $dist 'core') -Force
 }
 Copy-Item 'target/x86_64-pc-windows-msvc/release/litelan.exe' "$dist/LiteLAN.exe" -Force
-Copy-Item README.md "$dist/" -Force
-New-Item -ItemType Directory -Force "$dist/assets" | Out-Null
-Copy-Item -LiteralPath 'assets/LiteLAN Network Overview.png' -Destination "$dist/assets/" -Force
+# README.md and assets/ belong to the repository, not the binary release.
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD_PARTY.md') -Destination $dist -Force
 Compress-Archive -Path "$dist/*" -DestinationPath "$PSScriptRoot/LiteLAN-win-x64.zip" -Force
 Write-Host "Built: $dist/LiteLAN.exe"

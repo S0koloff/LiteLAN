@@ -1,3 +1,0 @@
-# LiteLAN v0.1.11
-
-Overview follows the supplied edited 440 × 660 logical-pixel layout. Initial and minimum window sizes are 440 × 660 at default scale. Header and navigation are fixed; the device list scrolls with the content. The redundant Add peer button is hidden on Overview; use Connect in the bottom navigation. Connection status uses a colored dot and vector glyph; direct connections pulse. The existing worker, local API, profile and authorization patch are unchanged. The package contains updated Rust source and Cargo version only; extract over v0.1.10 (or retain its existing core build scripts and assets). Windows compilation and rendering have not been tested here.

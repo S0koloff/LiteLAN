@@ -13,16 +13,18 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str { v[key.to_ascii_lowercase()].as_st
 fn s_value(v:&Value,k:&str)->String{s(v,k).to_owned()}
 fn arr(v: &Value) -> &[Value] { v.as_array().map(Vec::as_slice).unwrap_or(&[]) }
 fn yes(v: &Value, key: &str) -> bool { v[key.to_ascii_lowercase()].as_bool().unwrap_or(false) }
+fn decode_api_json(text:&str)->R<Value>{let v:Value=serde_json::from_str(text).map_err(err)?;let v=if let Some(inner)=v.as_str(){serde_json::from_str(inner).map_err(err)?}else{v};Ok(normalize(v))}
 struct Api(reqwest::blocking::Client);
 impl Api {
  fn new() -> R<Self> { Ok(Self(reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(3)).build().map_err(err)?)) }
  fn call(&self, path: &str, body: Option<Value>) -> R<String> {
   let u = format!("{BASE}{path}");
-  let r = match body { Some(v) => self.0.post(u).json(&v), None => self.0.get(u) }.send().map_err(err)?;
+  let request = match body { Some(v) => self.0.post(u).json(&v), None => self.0.get(u) };
+  let r = (if path=="/peers/litelan_prepare_invite" { request.timeout(Duration::from_secs(35)) } else { request }).send().map_err(err)?;
   let status = r.status(); let text = r.text().map_err(err)?;
   if !status.is_success() { return Err(format!("HTTP {status}: {text}")); } Ok(text)
  }
- fn get(&self, p: &str) -> R<Value> { serde_json::from_str(&self.call(p,None)?).map(normalize).map_err(err) }
+ fn get(&self, p: &str) -> R<Value> { decode_api_json(&self.call(p,None)?) }
  fn post(&self,p:&str,v:Value)->R<String>{self.call(p,Some(v))}
  fn post_json(&self,p:&str,v:Value)->R<Value>{serde_json::from_str(&self.post(p,v)?).map(normalize).map_err(err)}
 }
@@ -82,8 +84,19 @@ fn worker(rx:Receiver<Job>,tx:Sender<Event>,ctx:egui::Context){
    Ok(Job::Logs)=>{let text=api.call("/debug/log?logs=100",None).or_else(|_|fs::read_to_string(profile()?.join("core.log")).map_err(err));match text{Ok(t)=>send(Event::Logs(t)),Err(e)=>send(Event::Error(e))}},
    Ok(job)=>{
     let res=match job {
-     Job::Invite=>api.post("/peers/invites/create",json!({"maxUses":1,"expiresInSeconds":86400,"allowUsingAsExitNode":false})).and_then(|t|{let v=normalize(serde_json::from_str::<Value>(&t).map_err(err)?);let link=s(&v,"link");if link.is_empty(){return Err("Invite response missing link".into())}send(Event::Invite(link.into()));Ok(String::new())}),
-     Job::Add(link,alias)=>parse_invite(&link,&alias).and_then(|v|{let id=v["peerID"].as_str().unwrap_or("").to_owned();api.get("/settings/peer_info").and_then(|me|{if s(&me,"peerid")==id{return Err("Cannot add your own device".into())}api.post("/peers/invite_peer",v).map_err(|e|if e.contains("peer has already been added"){"Device already saved. Open Overview to see its connection status; remove it first if you need to use a new invitation.".into()}else{e})}).map(|t|{send(Event::Added(id));t})}),
+     Job::Invite=>api.post_json("/peers/litelan_prepare_invite",json!({})).and_then(|routes|{
+       let addresses=arr(&routes["addresses"]);if addresses.is_empty(){return Err("No verified IPv4 relay available. Try again shortly.".into())}
+       api.post_json("/peers/invites/create",json!({"maxUses":1,"expiresInSeconds":86400,"allowUsingAsExitNode":false})).and_then(|v|{
+        let link=s(&v,"link");if link.is_empty(){return Err("Invite response missing link".into())}
+        let link=with_invite_routes(link,addresses)?;send(Event::Invite(link));Ok(String::new())
+       })
+     }),
+     Job::Add(link,alias)=>parse_invite(&link,&alias).and_then(|mut v|{let id=v["peerID"].as_str().unwrap_or("").to_owned();api.get("/settings/peer_info").and_then(|me|{
+      if s(&me,"peerid")==id{return Err("Cannot add your own device".into())}
+      let routes=v.as_object_mut().and_then(|m|m.remove("addresses")).unwrap_or_else(||json!([]));
+      if !arr(&routes).is_empty(){api.post("/peers/litelan_invite_routes",json!({"peerID":id,"addresses":routes}))?;}
+      api.post("/peers/invite_peer",v).map_err(|e|if e.contains("peer has already been added"){"Device already saved. Open Overview and choose Try again, or remove it to use a new invitation.".into()}else{e})
+     }).map(|t|{send(Event::Added(id));t})}),
      Job::Accept(id,alias,decline)=>api.post("/peers/accept_peer",json!({"peerID":id,"alias":alias,"decline":decline,"allowUsingAsExitNode":false})),
      Job::Rename(name)=>api.post("/settings/update",json!({"name":if name.trim().is_empty(){default_name()}else{name}})),
      Job::Retry(id)=>api.post("/peers/litelan_retry",json!({"peerID":id})).map(|t|{send(Event::RetryQueued(id));t}),
@@ -113,11 +126,23 @@ fn worker(rx:Receiver<Job>,tx:Sender<Event>,ctx:egui::Context){
 }
 fn stop(child:&mut Option<Child>){if let Some(mut c)=child.take(){let _=c.kill();let _=c.wait();}}
 fn parse_invite(link:&str,alias:&str)->R<Value>{
+ if link.len()>16384{return Err("Invitation is too long".into())}
  let u=url::Url::parse(link.trim()).map_err(err)?;if u.scheme()!="awl"||u.host_str()!=Some("invite"){return Err("Expected awl://invite link".into())}
- let (mut id,mut name,mut token)=(String::new(),String::new(),String::new());
- for (k,v) in u.query_pairs(){match k.as_ref(){"p"=>id=v.into_owned(),"n"=>name=v.into_owned(),"t"|"token"=>token=v.into_owned(),_=>{}}}
+ let (mut id,mut name,mut token)=(String::new(),String::new(),String::new());let mut addresses:Vec<String>=Vec::new();
+ for (k,v) in u.query_pairs(){match k.as_ref(){"p"=>id=v.into_owned(),"n"=>name=v.into_owned(),"t"|"token"=>token=v.into_owned(),"a"=>{if addresses.len()>=16||v.len()>512{return Err("Invalid invitation route list".into())}addresses.push(v.into_owned());},_=>{}}}
  if id.is_empty(){return Err("Missing peer ID".into())} let alias=if !alias.trim().is_empty(){alias.trim().to_string()}else if !name.is_empty(){name}else{"Friend".into()};
- Ok(json!({"peerID":id,"alias":alias,"token":token,"allowUsingAsExitNode":false}))
+ Ok(json!({"peerID":id,"alias":alias,"token":token,"allowUsingAsExitNode":false,"addresses":addresses}))
+}
+fn with_invite_routes(link:&str,addresses:&[Value])->R<String>{
+ let mut u=url::Url::parse(link).map_err(err)?;
+ if u.scheme()!="awl"||u.host_str()!=Some("invite"){return Err("Invalid core invitation".into())}
+ {let mut q=u.query_pairs_mut();for a in addresses.iter().take(16){if let Some(a)=a.as_str(){q.append_pair("a",a);}}}
+ Ok(u.to_string())
+}
+fn diagnostics(data:&Snapshot)->String{
+ let peers:Vec<Value>=arr(&data.peers).iter().map(|p|json!({"peer_id":s(p,"peerid"),"name":peer_name(p),"confirmed":yes(p,"confirmed"),"connected":yes(p,"connected"),"declined":yes(p,"declined"),"stage":route(p),"connections":p["connections"],"cached_addresses":p["peerstoreaddrs"]})).collect();
+ let d=&data.debug["dht"];
+ serde_json::to_string_pretty(&json!({"litelan":env!("CARGO_PKG_VERSION"),"peer_id":s(&data.me,"peerid"),"reachability":s(&data.me,"reachability"),"bootstrap_connected":data.me["connectedbootstrappeers"],"dht_size":d["routingtablesize"],"listen_addresses":d["listenaddress"],"reachable_addresses":d["reachableaddrs"],"unreachable_addresses":d["unreachableaddrs"],"bootstrap":d["bootstrappeers"],"peers":peers})).unwrap_or_default()
 }
 struct App{tx:Sender<Job>,rx:Receiver<Event>,thread:Option<std::thread::JoinHandle<()>>,data:Snapshot,state:String,error:String,link:String,invite:String,name:String,logs:Option<String>,page:usize,dark:bool,busy:bool,pending:Option<(String,Instant)>,pending_hidden:bool,notice:String,notice_at:Instant,notice_kind:u8,name_loaded:bool,action_peer:Option<String>,confirm_reset:bool,confirm_block:Option<String>}
 impl App{
@@ -381,7 +406,7 @@ impl eframe::App for App{
      surface(ui,|ui|{ui.label(RichText::new("Device name").size(19.).strong());ui.add_enabled_ui(api&&!self.busy,|ui|{input_field(ui,&mut self.name,"Computer name");if full_button(ui,"Save",!self.busy,true){if self.name.trim().is_empty(){self.name=default_name();}self.job(Job::Rename(self.name.trim().into()));}});muted(ui,"Private LAN only · No DNS, SOCKS5 or exit node");});
      surface(ui,|ui|{ui.label(RichText::new("Reset application").size(19.).strong());muted(ui,"Remove saved devices, network identity and local settings.");ui.add_space(4.);if menu_action(ui,"reset","Reset all data",!self.busy,true,false){self.confirm_reset=true;}});
     },
-    _=>{ui.heading("Diagnostics");muted(ui,"Inspect the network core and connection health.");ui.add_space(12.);surface(ui,|ui|{ui.label(&self.state);ui.label(format!("Bootstrap: {boot} · DHT: {dht}"));muted(ui,format!("Reachability: {}",if s(&self.data.debug["dht"],"reachability").is_empty(){"Unknown"}else{s(&self.data.debug["dht"],"reachability")}));ui.label(format!("Adapter: {}",if yes(&self.data.me["vpn"],"vpninterfaceenabled"){"Enabled"}else{"Unavailable"}));ui.horizontal_wrapped(|ui|{if ui.add_enabled(!active,egui::Button::new("Start")).clicked(){self.job(Job::Start);}if ui.add_enabled(active,egui::Button::new("Stop")).clicked(){self.job(Job::Stop);}if primary(ui,"View core logs"){self.job(Job::Logs);}});});}
+    _=>{ui.heading("Diagnostics");muted(ui,"Inspect the network core and connection health.");ui.add_space(12.);surface(ui,|ui|{ui.label(&self.state);ui.label(format!("Bootstrap: {boot} · DHT: {dht}"));muted(ui,format!("Reachability: {}",if s(&self.data.debug["dht"],"reachability").is_empty(){"Unknown"}else{s(&self.data.debug["dht"],"reachability")}));ui.label(format!("Adapter: {}",if yes(&self.data.me["vpn"],"vpninterfaceenabled"){"Enabled"}else{"Unavailable"}));ui.horizontal_wrapped(|ui|{if ui.add_enabled(!active,egui::Button::new("Start")).clicked(){self.job(Job::Start);}if ui.add_enabled(active,egui::Button::new("Stop")).clicked(){self.job(Job::Stop);}if primary(ui,"View core logs"){self.job(Job::Logs);}});ui.add_space(8.);if full_button(ui,"Copy diagnostics",api,true){ctx.copy_text(diagnostics(&self.data));self.notify("Diagnostics copied. Review before sharing.");}muted(ui,"Includes network addresses and device IDs; no invite tokens.");});}
    }
   });});
   if self.notice_at.elapsed()>Duration::from_secs(5){self.notice.clear();}
@@ -473,13 +498,15 @@ impl eframe::App for App{
    let connected=peer.is_some_and(peer_ready);
    if connected||declined{self.pending=None;if connected{self.notify("Device connected. Virtual IP assigned.");}else{self.error="The remote device declined the request.".into();}}
    else if !dialog_open&&!self.pending_hidden {
-    let stage=peer.map(route).unwrap_or("Saving invitation");
-    let mut open=true;egui::Window::new("Connecting device").id(egui::Id::new("join_progress")).collapsible(false).resizable(false).open(&mut open).anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).show(ctx,|ui|{
+    let stage=if peer.is_some_and(|p|yes(p,"confirmed")){"Establishing tunnel"}else if peer.is_some_and(|p|yes(p,"connected")){"Authorizing invitation"}else{"Connecting to friend"};
+    let friend=peer.map(peer_name).unwrap_or_else(||"Friend".into());
+    let mut open=true;egui::Window::new("Joining friend’s network").id(egui::Id::new("join_progress")).collapsible(false).resizable(false).open(&mut open).anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).show(ctx,|ui|{
      ui.set_width(285.);ui.horizontal(|ui|{ui.spinner();ui.label(RichText::new(stage).size(19.).strong());});
      muted(ui,format!("{} seconds elapsed",since.elapsed().as_secs()));ui.separator();
-     ui.label("Invitation saved locally");
-     muted(ui,if peer.is_some_and(|p|yes(p,"confirmed")){"Authorized. Establishing the tunnel."}else if peer.is_some_and(|p|yes(p,"connected")){"Remote device reachable. Waiting for authorization."}else{"Discovering the remote device. Keep both clients online."});
-     if since.elapsed()>Duration::from_secs(60){ui.colored_label(c(211,157,68),"Connection is taking longer");muted(ui,"Automatic retry enabled. Keep both devices online.");}if full_button(ui,"Try again",!self.busy,true){self.job(Job::Retry(id.clone()));}if !peer.is_some_and(|p|yes(p,"confirmed"))&&ui.add_enabled(!self.busy,egui::Button::new("Cancel attempts")).clicked(){self.job(Job::Cancel(id.clone()));}
+     ui.label(RichText::new(&friend).strong());
+     muted(ui,"Invitation saved locally");
+     muted(ui,if peer.is_some_and(|p|yes(p,"confirmed")){"Authorized. Establishing the tunnel."}else if peer.is_some_and(|p|yes(p,"connected")){"Remote device reachable. Waiting for authorization."}else{"Trying known addresses, relay and DHT. Keep both clients online."});
+     if since.elapsed()>Duration::from_secs(60){ui.colored_label(c(211,157,68),"Connection is taking longer");muted(ui,"Automatic retries are enabled. If it stays offline, ask for a fresh invitation or open Diagnostics.");}if full_button(ui,"Try again",!self.busy,true){self.job(Job::Retry(id.clone()));}if !peer.is_some_and(|p|yes(p,"confirmed"))&&ui.add_enabled(!self.busy,egui::Button::new("Cancel attempts")).clicked(){self.job(Job::Cancel(id.clone()));}
      if full_button(ui,"Continue in background",true,false){self.pending_hidden=true;}
     });if !open{self.pending_hidden=true;}ctx.request_repaint_after(Duration::from_millis(100));
    }
@@ -493,3 +520,15 @@ fn main()->eframe::Result<()> {eframe::run_native("LiteLAN",eframe::NativeOption
 #[cfg(test)] mod tests{use super::*;#[test]fn parses_link(){let v=parse_invite("awl://invite?p=abc&n=My%20PC&t=secret","").unwrap();assert_eq!(v["peerID"],"abc");assert_eq!(v["alias"],"My PC");assert_eq!(v["token"],"secret");}#[test]fn actual_name_wins(){assert_eq!(peer_name(&json!({"remotename":"Remote-PC","alias":"Wrong alias"})),"Remote-PC");}#[test]fn rejects_http(){assert!(parse_invite("https://example.com","x").is_err());}#[test]fn go_json(){let me=normalize(json!({"VPN":{"IPNet":"10.64.160.184/11","VPNInterfaceEnabled":true},"ConnectedBootstrapPeers":4}));assert!(network_ready(&Snapshot{me,..Default::default()}));assert_eq!(ping(&normalize(json!({"Ping":18000000}))),"18 ms");assert_eq!(route(&normalize(json!({"Connected":true,"Confirmed":true,"IpAddr":"10.80.165.86","Connections":[{"ThroughRelay":false}]}))),"Direct");}}
 
 #[cfg(test)] mod ui_state_tests { use super::*; #[test] fn pending_is_not_online(){assert!(!peer_ready(&json!({"connected":true,"confirmed":false,"ipaddr":"10.64.1.2"})));} #[test] fn declined_is_not_online(){assert!(!peer_ready(&json!({"connected":true,"confirmed":true,"declined":true,"ipaddr":"10.64.1.2"})));} #[test] fn no_ip_is_not_online(){assert!(!peer_ready(&json!({"connected":true,"confirmed":true})));} }
+
+#[cfg(test)] mod invite_route_tests {
+ use super::*;
+ #[test] fn route_round_trip(){
+  let addresses=vec![json!("/ip4/8.8.8.8/tcp/4363"),json!("/ip6/2001:4860::1/udp/4363/quic-v1")];
+  let link=with_invite_routes("awl://invite?p=abc&n=Home-PC&t=secret",&addresses).unwrap();
+  let v=parse_invite(&link,"").unwrap();assert_eq!(v["token"],"secret");assert_eq!(v["addresses"],json!(addresses));
+ }
+ #[test] fn old_invite_works(){assert_eq!(parse_invite("awl://invite?p=abc&n=Home-PC&t=secret","").unwrap()["addresses"],json!([]));}
+ #[test] fn rejects_excessive_routes(){let link=format!("awl://invite?p=abc{}","&a=x".repeat(17));assert!(parse_invite(&link,"").is_err());}
+ #[test] fn parses_string_wrapped_debug(){let inner=r#"{"DHT":{"RoutingTableSize":72}}"#;let wrapped=serde_json::to_string(inner).unwrap();assert_eq!(decode_api_json(&wrapped).unwrap()["dht"]["routingtablesize"],72);}
+}
